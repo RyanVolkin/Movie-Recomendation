@@ -207,6 +207,18 @@ input {
   gap: 8px;
 }
 
+.movie-poster {
+  width: 100%;
+  max-width: 180px;
+  max-height: 270px;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  background: #f3eee4;
+  justify-self: start;
+}
+
 .movie-card p {
   margin-top: 6px;
   color: var(--muted);

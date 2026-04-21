@@ -21,12 +21,29 @@ export function fetchMostLiked(limit = 10) {
   return request(`/movies/liked?limit=${limit}`)
 }
 
-export function searchMovies(query) {
-  return request(`/movies/search?q=${encodeURIComponent(query)}`)
+export function searchMovies(query, options = {}) {
+  const limit = options.limit ?? 50
+  const offset = options.offset ?? 0
+
+  return request(
+    `/movies/search?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`,
+  )
 }
 
-export function likeMovie(id) {
+export function fetchUserLikedMovieIds(userId) {
+  return request(`/movies/likes?userId=${encodeURIComponent(userId)}`)
+}
+
+export function likeMovie(id, userId) {
   return request(`/movies/${id}/like`, {
     method: 'POST',
+    body: JSON.stringify({ userId }),
+  })
+}
+
+export function unlikeMovie(id, userId) {
+  return request(`/movies/${id}/unlike`, {
+    method: 'POST',
+    body: JSON.stringify({ userId }),
   })
 }
