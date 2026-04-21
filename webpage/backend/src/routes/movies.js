@@ -5,6 +5,8 @@ const router = express.Router()
 const MOVIE_SELECT =
   'id:tconst,title,release_year,runtime,rating,numratings,genre1,genre2,genre3,likes_count:like_count'
 
+// Using JS HDBSCAN loader below
+
 function sanitizeUserId(value) {
   if (typeof value !== 'string') {
     return ''
@@ -235,6 +237,218 @@ router.post('/:id/unlike', async (req, res) => {
   }
 
   return res.json({ unliked: true, movie: updatedMovie })
+})
+
+// (previous Python helper removed) JS helper below
+
+  async function runHdbscanJS(dataMatrix, minClusterSize = 2, minSamples = null) {
+    // Try to load a JS HDBSCAN implementation. If not installed, return an error instructing install.
+    let hdbscanModule
+    try {
+      hdbscanModule = require('hdbscan')
+    } catch (e) {
+      throw new Error('JS HDBSCAN module not found. Please run `npm install hdbscan` in the backend folder.')
+    }
+
+    function labelsToClusters(labels) {
+      const clusters = {}
+      labels.forEach((lab, idx) => {
+        if (lab === -1) {
+          clusters[`noise_${idx}`] = clusters[`noise_${idx}`] || []
+          clusters[`noise_${idx}`].push(idx)
+        } else {
+          clusters[lab] = clusters[lab] || []
+          clusters[lab].push(idx)
+        }
+      })
+      return Object.values(clusters)
+    }
+
+    // Attempt a few common JS hdbscan module APIs
+    // 1) module is a function that returns labels or an object with .labels
+    if (typeof hdbscanModule === 'function') {
+      const maybe = hdbscanModule(dataMatrix, { min_cluster_size: minClusterSize, min_samples: minSamples })
+      if (Array.isArray(maybe)) return labelsToClusters(maybe)
+      if (maybe && Array.isArray(maybe.labels)) return labelsToClusters(maybe.labels)
+    }
+
+    // 2) module exports HDBSCAN class
+    if (hdbscanModule.HDBSCAN) {
+      try {
+        const Cls = hdbscanModule.HDBSCAN
+        const inst = new Cls({ min_cluster_size: minClusterSize, min_samples: minSamples })
+        if (typeof inst.fit === 'function') {
+          const fitted = inst.fit(dataMatrix)
+          if (Array.isArray(fitted)) return labelsToClusters(fitted)
+          if (fitted && Array.isArray(fitted.labels)) return labelsToClusters(fitted.labels)
+          if (Array.isArray(inst.labels)) return labelsToClusters(inst.labels)
+        }
+      } catch (e) {
+        // fallthrough to next attempts
+      }
+    }
+
+    // 3) module has .fit or .cluster static methods
+    if (typeof hdbscanModule.fit === 'function') {
+      const res = hdbscanModule.fit(dataMatrix, { min_cluster_size: minClusterSize, min_samples: minSamples })
+      if (Array.isArray(res)) return labelsToClusters(res)
+      if (res && Array.isArray(res.labels)) return labelsToClusters(res.labels)
+    }
+
+    if (typeof hdbscanModule.cluster === 'function') {
+      const res = hdbscanModule.cluster(dataMatrix, { min_cluster_size: minClusterSize, min_samples: minSamples })
+      if (Array.isArray(res)) return labelsToClusters(res)
+      if (res && Array.isArray(res.labels)) return labelsToClusters(res.labels)
+    }
+
+    throw new Error('Unsupported JS HDBSCAN module API. Install a compatible `hdbscan` package.')
+  }
+router.get('/:id/recommend', async (req, res) => {
+  const userId = sanitizeUserId(req.params.id)
+
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required.' })
+  }
+
+  const limitPerCluster = Math.max(Number.parseInt(req.query.limitPerCluster, 10) || 5, 1)
+  const minClusterSize = Math.max(Number.parseInt(req.query.minClusterSize, 10) || 2, 1)
+  const minSamples = req.query.minSamples !== undefined ? Number.parseInt(req.query.minSamples, 10) : null
+
+  // Get liked movie ids
+  const { data: likes, error: likesError } = await supabaseAdmin
+    .from('user_movie_likes')
+    .select('movie_id')
+    .eq('user_id', userId)
+
+  if (likesError) {
+    return res.status(500).json({ error: likesError.message })
+  }
+
+  const likedIds = (likes || []).map((r) => r.movie_id)
+
+  if (!likedIds.length) {
+    return res.status(400).json({ error: 'No liked movies found for user.' })
+  }
+
+  // Fetch vectors for liked movies
+  const { data: likedVectorsData, error: vectorsError } = await supabaseAdmin
+    .from('movie_vectors')
+    .select('tconst,genre_vector')
+    .in('tconst', likedIds)
+
+  if (vectorsError) {
+    return res.status(500).json({ error: vectorsError.message })
+  }
+
+  function parseVector(v) {
+    if (Array.isArray(v)) return v.map((n) => Number(n))
+    if (typeof v === 'string') {
+      return v.replace(/^[\[\]]|\s/g, '').split(',').map((s) => Number(s))
+    }
+    return []
+  }
+
+  const likedVectors = likedVectorsData.map((r) => ({ tconst: r.tconst, vector: parseVector(r.genre_vector) }))
+
+  if (!likedVectors.length) {
+    return res.status(400).json({ error: 'No vectors available for liked movies.' })
+  }
+
+  const dataMatrix = likedVectors.map((r) => r.vector)
+
+  // Cluster liked vectors using HDBSCAN (JS). If clustering fails or returns none,
+  // fall back to single cluster containing all liked vectors.
+  let clusters = []
+  try {
+    clusters = await runHdbscanJS(dataMatrix, minClusterSize, minSamples)
+  } catch (e) {
+    clusters = []
+  }
+
+  if (!clusters || !clusters.length) {
+    clusters = [dataMatrix.map((_, i) => i)]
+  }
+
+  function euclidean(a, b) {
+    let s = 0
+    for (let i = 0; i < a.length; i += 1) {
+      const d = (a[i] || 0) - (b[i] || 0)
+      s += d * d
+    }
+    return Math.sqrt(s)
+  }
+
+  function medoidIndex(indices) {
+    if (indices.length === 1) return indices[0]
+    let best = indices[0]
+    let bestSum = Infinity
+    for (const i of indices) {
+      let sum = 0
+      for (const j of indices) {
+        if (i === j) continue
+        sum += euclidean(dataMatrix[i], dataMatrix[j])
+      }
+      if (sum < bestSum) {
+        bestSum = sum
+        best = i
+      }
+    }
+    return best
+  }
+
+  // Get all movie vectors to search neighbors (note: may be heavy for very large datasets)
+  const { data: allVectorsData, error: allVecsError } = await supabaseAdmin
+    .from('movie_vectors')
+    .select('tconst,genre_vector')
+
+  if (allVecsError) {
+    return res.status(500).json({ error: allVecsError.message })
+  }
+
+  const allVectors = allVectorsData.map((r) => ({ tconst: r.tconst, vector: parseVector(r.genre_vector) }))
+
+  const results = []
+
+  for (const clusterIndices of clusters) {
+    const medoidIdx = medoidIndex(clusterIndices)
+    const medoid = likedVectors[medoidIdx]
+    const repVec = medoid.vector
+
+    // compute distances to all vectors, exclude movies the user already liked
+    const distances = []
+    for (const mv of allVectors) {
+      if (likedIds.includes(mv.tconst)) continue
+      const d = euclidean(repVec, mv.vector)
+      distances.push({ tconst: mv.tconst, distance: d })
+    }
+
+    distances.sort((a, b) => a.distance - b.distance)
+    const kNeighbors = distances.slice(0, limitPerCluster).map((d) => d.tconst)
+
+    // Fetch movie details for neighbors (and medoid if available)
+    const tconstsToFetch = [...new Set([medoid.tconst, ...kNeighbors])]
+    const { data: movieDetails, error: movieDetailsError } = await supabaseAdmin
+      .from('movies')
+      .select(MOVIE_SELECT)
+      .in('tconst', tconstsToFetch)
+
+    if (movieDetailsError) {
+      return res.status(500).json({ error: movieDetailsError.message })
+    }
+
+    const byId = (movieDetails || []).reduce((acc, m) => {
+      acc[m.id] = m
+      return acc
+    }, {})
+
+    results.push({
+      medoid: medoid.tconst,
+      medoid_movie: byId[medoid.tconst] || null,
+      neighbors: kNeighbors.map((t) => byId[t]).filter(Boolean),
+    })
+  }
+
+  return res.json({ clusters: results })
 })
 
 module.exports = router

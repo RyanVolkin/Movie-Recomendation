@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { supabase } from './lib/supabase'
-import { fetchMostLiked, fetchUserLikedMovieIds, likeMovie, searchMovies, unlikeMovie } from './lib/api'
+import { fetchMostLiked, fetchUserLikedMovieIds, likeMovie, searchMovies, unlikeMovie, fetchRecommendations } from './lib/api'
 
 const email = ref('')
 const password = ref('')
@@ -19,6 +19,7 @@ const mostLikedMovies = ref([])
 const likedMovieIds = ref([])
 const dataLoading = ref(false)
 const dataMessage = ref('')
+const recommendationClusters = ref([])
 
 const SEARCH_PAGE_SIZE = 10
 
@@ -196,7 +197,7 @@ async function likeAndRefresh(movieId) {
       likedMovieIds.value = [movieId, ...likedMovieIds.value]
     }
 
-    await Promise.all([loadMostLiked(), runRecommendationSearch()])
+    await Promise.all([loadMostLiked(), runRecommendationSearch(), loadRecommendations()])
   } catch (error) {
     dataMessage.value = error.message
   }
@@ -214,7 +215,7 @@ async function unlikeAndRefresh(movieId) {
 
     likedMovieIds.value = likedMovieIds.value.filter((id) => id !== movieId)
 
-    await Promise.all([loadMostLiked(), runRecommendationSearch()])
+    await Promise.all([loadMostLiked(), runRecommendationSearch(), loadRecommendations()])
   } catch (error) {
     dataMessage.value = error.message
   }
@@ -227,10 +228,11 @@ onMounted(async () => {
 
   currentUser.value = session?.user || null
 
-  if (currentUser.value?.id) {
-    await loadUserLikedMovieIds(currentUser.value.id)
-    await loadMostLiked()
-  }
+    if (currentUser.value?.id) {
+      await loadUserLikedMovieIds(currentUser.value.id)
+      await loadMostLiked()
+      await loadRecommendations()
+    }
 
   supabase.auth.onAuthStateChange(async (_event, sessionUpdate) => {
     currentUser.value = sessionUpdate?.user || null
@@ -238,6 +240,7 @@ onMounted(async () => {
     if (currentUser.value?.id) {
       await loadUserLikedMovieIds(currentUser.value.id)
       await loadMostLiked()
+      await loadRecommendations()
     } else {
       likedMovieIds.value = []
       mostLikedMovies.value = []
@@ -248,6 +251,30 @@ onMounted(async () => {
     }
   })
 })
+
+async function loadRecommendations() {
+  recommendationClusters.value = []
+
+  const userId = currentUser.value?.id
+  if (!userId) return
+
+  dataLoading.value = true
+  dataMessage.value = ''
+
+  try {
+    const data = await fetchRecommendations(userId)
+    recommendationClusters.value = Array.isArray(data?.clusters) ? data.clusters : []
+  } catch (error) {
+    dataMessage.value = error.message
+  } finally {
+    dataLoading.value = false
+  }
+}
+
+async function openRecommendationTab() {
+  activeTab.value = 'recommendation'
+  await loadRecommendations()
+}
 </script>
 
 <template>
@@ -301,7 +328,7 @@ onMounted(async () => {
         <button
           class="tab"
           :class="{ active: activeTab === 'recommendation' }"
-          @click="activeTab = 'recommendation'"
+          @click="openRecommendationTab"
         >
           Recommendation
         </button>
@@ -344,30 +371,39 @@ onMounted(async () => {
       <div v-else-if="activeTab === 'recommendation'" class="tab-panel">
         <h3>Movie recommendation</h3>
 
-        <h3>Suggested from trends</h3>
-        <ul class="movie-list">
-          <li v-for="movie in suggestionMovies" :key="`suggested-${movie.id}`" class="movie-card">
-            <img
-              v-if="getPosterSrc(movie)"
-              class="movie-poster"
-              :src="getPosterSrc(movie)"
-              :alt="`${movie.title} poster`"
-              loading="lazy"
-            />
-            <div>
-              <strong>{{ movie.title }}</strong>
-              <p>{{ formatGenres(movie) || 'No genres yet.' }}</p>
+        <h3>Personal recommendations</h3>
+        <div v-if="dataLoading" class="status">Loading recommendations...</div>
+        <ul v-else class="movie-list">
+          <li v-for="cluster in recommendationClusters" :key="`cluster-${cluster.medoid}`" class="cluster-card">
+            <div class="cluster-header">
+              <strong>Cluster medoid</strong>
+              <span v-if="cluster.medoid_movie"> — {{ cluster.medoid_movie.title }}</span>
             </div>
-            <div class="row-between">
-              <span>Rating: {{ movie.rating }} / 10</span>
-            </div>
-            <div class="row-between">
-              <span>Likes: {{ movie.likes_count }}</span>
-              <button class="btn tiny" @click="likeAndRefresh(movie.id)">Like</button>
-            </div>
+            <ul class="movie-list">
+              <li v-for="movie in cluster.neighbors" :key="`rec-${movie.id}`" class="movie-card">
+                <img
+                  v-if="getPosterSrc(movie)"
+                  class="movie-poster"
+                  :src="getPosterSrc(movie)"
+                  :alt="`${movie.title} poster`"
+                  loading="lazy"
+                />
+                <div>
+                  <strong>{{ movie.title }}</strong>
+                  <p>{{ formatGenres(movie) || 'No genres yet.' }}</p>
+                </div>
+                <div class="row-between">
+                  <span>Rating: {{ movie.rating }} / 10</span>
+                </div>
+                <div class="row-between">
+                  <span>Likes: {{ movie.likes_count }}</span>
+                  <button class="btn tiny" @click="likeAndRefresh(movie.id)">Like</button>
+                </div>
+              </li>
+            </ul>
           </li>
-          <li v-if="!suggestionMovies.length && !dataLoading" class="empty-state">
-            Add more movies and likes to improve recommendations.
+          <li v-if="!recommendationClusters.length && !dataLoading" class="empty-state">
+            Add more likes to get personalized recommendations.
           </li>
         </ul>
       </div>
