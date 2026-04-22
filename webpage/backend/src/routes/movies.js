@@ -419,14 +419,34 @@ router.get('/:id/recommend', async (req, res) => {
     for (const mv of allVectors) {
       if (likedIds.includes(mv.tconst)) continue
       const d = euclidean(repVec, mv.vector)
-      distances.push({ tconst: mv.tconst, distance: d })
+      distances.push({ tconst: mv.tconst, distance: d, vector: mv.vector })
     }
 
+    // Find the 50 closest neighbors to the medoid
     distances.sort((a, b) => a.distance - b.distance)
-    const kNeighbors = distances.slice(0, limitPerCluster).map((d) => d.tconst)
+    const closest50 = distances.slice(0, 50)
+
+    // For each of the 50, compute fit to cluster: sum of distances to all cluster members
+    function clusterFitScore(candidateVec, clusterIndices) {
+      let sum = 0
+      for (const idx of clusterIndices) {
+        sum += euclidean(candidateVec, dataMatrix[idx])
+      }
+      return sum
+    }
+
+    // Compute fit score for each of the 50
+    const withFit = closest50.map((entry) => ({
+      ...entry,
+      fitScore: clusterFitScore(entry.vector, clusterIndices)
+    }))
+
+    // Sort by fit score (lower is better), pick top 5
+    withFit.sort((a, b) => a.fitScore - b.fitScore)
+    const best5 = withFit.slice(0, limitPerCluster)
 
     // Fetch movie details for neighbors (and medoid if available)
-    const tconstsToFetch = [...new Set([medoid.tconst, ...kNeighbors])]
+    const tconstsToFetch = [...new Set([medoid.tconst, ...best5.map(d => d.tconst)])]
     const { data: movieDetails, error: movieDetailsError } = await supabaseAdmin
       .from('movies')
       .select(MOVIE_SELECT)
@@ -444,7 +464,11 @@ router.get('/:id/recommend', async (req, res) => {
     results.push({
       medoid: medoid.tconst,
       medoid_movie: byId[medoid.tconst] || null,
-      neighbors: kNeighbors.map((t) => byId[t]).filter(Boolean),
+      neighbors: best5.map(({ tconst, distance, fitScore }) => {
+        const movie = byId[tconst]
+        if (!movie) return null
+        return { ...movie, distance_to_medoid: distance, fit_score: fitScore }
+      }).filter(Boolean),
     })
   }
 
