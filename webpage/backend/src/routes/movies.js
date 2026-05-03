@@ -3,7 +3,7 @@ const supabaseAdmin = require('../supabaseAdmin')
 
 const router = express.Router()
 const MOVIE_SELECT =
-  'id:tconst,title,release_year,runtime,rating,numratings,genre1,genre2,genre3,language,likes_count:like_count'
+  'id:tconst,title,release_year,runtime,rating,numratings,genre1,genre2,genre3,likes_count:like_count'
 
 // Using JS HDBSCAN loader below
 
@@ -422,18 +422,15 @@ router.get('/:id/recommend', async (req, res) => {
   const MAX_SYNTH_TOTAL = 400
 
 
-  // Load liked movie genres, years, and languages
+  // Load liked movie genres, years
   const { data: likedMovieDetails, error: likedMovieDetailsError } = await supabaseAdmin
     .from('movies')
-    .select('tconst,genre1,genre2,genre3,release_year,language')
+    .select('tconst,genre1,genre2,genre3,release_year')
     .in('tconst', likedIds)
 
   if (likedMovieDetailsError) {
     return res.status(500).json({ error: likedMovieDetailsError.message })
   }
-
-  // Collect all unique languages from liked movies
-  const likedLanguages = new Set((likedMovieDetails || []).map(m => (m.language || '').trim()).filter(Boolean));
 
   const genreCounts = {}
   const genreVectors = {}
@@ -589,10 +586,10 @@ router.get('/:id/recommend', async (req, res) => {
     return res.status(500).json({ error: movieDetailsError.message });
   }
 
-  // Filter candidates to only those that share a language with a liked movie
+  // Filter candidates to only those that share a with a liked movie
   const filteredCandidates = allCandidates.filter(item => {
     const details = movieDetails.find(m => m.id === item.tconst);
-    return details && likedLanguages.has((details.language || '').trim());
+    return details
   });
   // Compute liked-year stats for outlier detection
   const likedYears = (likedMovieDetails || [])
