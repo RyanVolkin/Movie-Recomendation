@@ -17,8 +17,18 @@ async function request(path, options = {}) {
   return response.json()
 }
 
-export function fetchMostLiked(limit = 10) {
-  return request(`/movies/liked?limit=${limit}`)
+export function fetchMostLiked(limit = 10, offset = 0) {
+  return request(`/movies/liked?limit=${limit}&offset=${offset}`)
+}
+
+export function fetchUserLikedMovies(userId, limit = 10, offset = 0) {
+  return request(
+    `/movies/liked?userId=${encodeURIComponent(userId)}&limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`,
+  )
+}
+
+export async function getNumberOfLikedMovies(userId) {
+  return request(`/movies/liked/count?userId=${encodeURIComponent(userId)}`)
 }
 
 export function searchMovies(query, options = {}) {

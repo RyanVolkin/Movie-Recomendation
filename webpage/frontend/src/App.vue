@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { supabase } from './lib/supabase'
-import { fetchMostLiked, fetchUserLikedMovieIds, likeMovie, searchMovies, unlikeMovie, fetchRecommendations } from './lib/api'
+import { fetchMostLiked, fetchUserLikedMovieIds, fetchUserLikedMovies, likeMovie, searchMovies, unlikeMovie, fetchRecommendations, getNumberOfLikedMovies } from './lib/api'
 
 const email = ref('')
 const password = ref('')
@@ -19,7 +19,9 @@ const mostLikedMovies = ref([])
 const likedMovieIds = ref([])
 const dataLoading = ref(false)
 const dataMessage = ref('')
-const recommendationClusters = ref([])
+const recommendedMovies = ref([])
+const numberOfLikedMovies = ref(0)
+const likedMoviesOffset = ref(0)
 
 const SEARCH_PAGE_SIZE = 10
 
@@ -33,25 +35,45 @@ const suggestionMovies = computed(() => {
   return mostLikedMovies.value.filter((movie) => !likedSet.has(movie.id)).slice(0, 6)
 })
 
-const movieIndex = computed(() => {
-  const map = new Map()
+const movieIndex = ref(new Map())
 
-  for (const movie of mostLikedMovies.value) {
-    map.set(movie.id, movie)
+function updateMovieIndex(movies) {
+  for (const movie of movies) {
+    if (movie && movie.id) {
+      movieIndex.value.set(movie.id, movie)
+    }
   }
+}
 
-  for (const movie of recommendationSearchResults.value) {
-    map.set(movie.id, movie)
-  }
-
-  return map
-})
-
-const yourLikedMovies = computed(() => {
+// Load more for liked movies
+const LIKED_LOAD_SIZE = 10
+const likedVisibleCount = ref(LIKED_LOAD_SIZE)
+const pagedLikedMovies = computed(() => {
   return likedMovieIds.value
     .map((id) => movieIndex.value.get(id))
     .filter((movie) => Boolean(movie))
+    .slice(0, likedVisibleCount.value)
 })
+async function loadMoreLiked() {
+  const userId = currentUser.value?.id
+  if (!userId) return
+
+  // Fetch next slice of this user's liked movies.
+  try {
+    const moreMovies = await fetchUserLikedMovies(userId, LIKED_LOAD_SIZE, likedMoviesOffset.value)
+    if (Array.isArray(moreMovies) && moreMovies.length) {
+      updateMovieIndex(moreMovies)
+      likedMoviesOffset.value += moreMovies.length
+    }
+  } catch (e) {
+    // ignore
+  }
+  likedVisibleCount.value += LIKED_LOAD_SIZE
+}
+function resetLikedVisible() {
+  likedVisibleCount.value = LIKED_LOAD_SIZE
+  likedMoviesOffset.value = 0
+}
 
 function getPosterSrc(movie) {
   const movieId = movie?.id?.trim()
@@ -70,11 +92,33 @@ function formatGenres(movie) {
 async function loadUserLikedMovieIds(userId) {
   if (!userId) {
     likedMovieIds.value = []
+    resetLikedVisible()
     return
   }
 
   const ids = await fetchUserLikedMovieIds(userId)
   likedMovieIds.value = Array.isArray(ids) ? ids : []
+  resetLikedVisible()
+
+  try {
+    const firstPage = await fetchUserLikedMovies(userId, LIKED_LOAD_SIZE, 0)
+    if (Array.isArray(firstPage) && firstPage.length) {
+      updateMovieIndex(firstPage)
+      likedMoviesOffset.value = firstPage.length
+    }
+  } catch (error) {
+    dataMessage.value = error.message
+  }
+}
+
+async function loadNumberOfLikedMovies(userId) {
+  if (!userId) {
+    numberOfLikedMovies.value = 0
+    return
+  }
+
+  const { count } = await getNumberOfLikedMovies(userId)
+  numberOfLikedMovies.value = count || 0
 }
 
 async function loadMostLiked() {
@@ -82,7 +126,9 @@ async function loadMostLiked() {
   dataMessage.value = ''
 
   try {
-    mostLikedMovies.value = await fetchMostLiked(12)
+    const movies = await fetchMostLiked(12, 0)
+    mostLikedMovies.value = movies
+    updateMovieIndex(movies)
   } catch (error) {
     dataMessage.value = error.message
   } finally {
@@ -112,6 +158,8 @@ async function submitAuth() {
       authMessage.value = 'Logged in successfully.'
       await loadUserLikedMovieIds(currentUser.value?.id || '')
       await loadMostLiked()
+      await loadNumberOfLikedMovies(currentUser.value?.id || '')
+
     }
   } catch (error) {
     authMessage.value = error.message
@@ -150,6 +198,7 @@ async function runRecommendationSearch() {
     })
 
     recommendationSearchResults.value = page
+    updateMovieIndex(page)
     exploreSearchOffset.value = page.length
     exploreHasMoreResults.value = page.length === SEARCH_PAGE_SIZE
   } catch (error) {
@@ -197,7 +246,12 @@ async function likeAndRefresh(movieId) {
       likedMovieIds.value = [movieId, ...likedMovieIds.value]
     }
 
-    await Promise.all([loadMostLiked(), runRecommendationSearch(), loadRecommendations()])
+    await Promise.all([
+      loadMostLiked(),
+      runRecommendationSearch(),
+      loadRecommendations(),
+      loadNumberOfLikedMovies(userId),
+    ])
   } catch (error) {
     dataMessage.value = error.message
   }
@@ -215,7 +269,12 @@ async function unlikeAndRefresh(movieId) {
 
     likedMovieIds.value = likedMovieIds.value.filter((id) => id !== movieId)
 
-    await Promise.all([loadMostLiked(), runRecommendationSearch(), loadRecommendations()])
+    await Promise.all([
+      loadMostLiked(),
+      runRecommendationSearch(),
+      loadRecommendations(),
+      loadNumberOfLikedMovies(userId),
+    ])
   } catch (error) {
     dataMessage.value = error.message
   }
@@ -232,6 +291,7 @@ onMounted(async () => {
       await loadUserLikedMovieIds(currentUser.value.id)
       await loadMostLiked()
       await loadRecommendations()
+      await loadNumberOfLikedMovies(currentUser.value.id)
     }
 
   supabase.auth.onAuthStateChange(async (_event, sessionUpdate) => {
@@ -241,6 +301,7 @@ onMounted(async () => {
       await loadUserLikedMovieIds(currentUser.value.id)
       await loadMostLiked()
       await loadRecommendations()
+      await loadNumberOfLikedMovies(currentUser.value.id)
     } else {
       likedMovieIds.value = []
       mostLikedMovies.value = []
@@ -248,12 +309,13 @@ onMounted(async () => {
       exploreSearchInput.value = ''
       exploreSearchOffset.value = 0
       exploreHasMoreResults.value = false
+      numberOfLikedMovies.value = 0
     }
   })
 })
 
 async function loadRecommendations() {
-  recommendationClusters.value = []
+  recommendedMovies.value = []
 
   const userId = currentUser.value?.id
   if (!userId) return
@@ -263,7 +325,12 @@ async function loadRecommendations() {
 
   try {
     const data = await fetchRecommendations(userId)
-    recommendationClusters.value = Array.isArray(data?.clusters) ? data.clusters : []
+    // Accept new API: data.neighbors is a flat array of movies
+    if (Array.isArray(data?.neighbors)) {
+      recommendedMovies.value = [
+        ...data.neighbors
+      ]
+    } 
   } catch (error) {
     dataMessage.value = error.message
   } finally {
@@ -341,8 +408,9 @@ async function openRecommendationTab() {
 
       <div v-if="activeTab === 'liked'" class="tab-panel">
         <h3>Your liked movies</h3>
+        {{numberOfLikedMovies}} liked {{ numberOfLikedMovies === 1 ? 'movie' : 'movies' }}
         <ul class="movie-list">
-          <li v-for="movie in yourLikedMovies" :key="`liked-personal-${movie.id}`" class="movie-card">
+          <li v-for="movie in pagedLikedMovies" :key="`liked-personal-${movie.id}`" class="movie-card">
             <img
               v-if="getPosterSrc(movie)"
               class="movie-poster"
@@ -362,25 +430,26 @@ async function openRecommendationTab() {
               <button class="btn tiny" @click="unlikeAndRefresh(movie.id)">Unlike</button>
             </div>
           </li>
-          <li v-if="!yourLikedMovies.length && !dataLoading" class="empty-state">
+          <li v-if="!pagedLikedMovies.length && !dataLoading" class="empty-state">
             Like movies from other tabs and they will appear here.
           </li>
         </ul>
+        <button
+          v-if="pagedLikedMovies.length < numberOfLikedMovies"
+          class="btn subtle"
+          type="button"
+          :disabled="dataLoading"
+          @click="loadMoreLiked"
+        >
+          {{ dataLoading ? 'Loading...' : 'Load more' }}
+        </button>
       </div>
 
       <div v-else-if="activeTab === 'recommendation'" class="tab-panel">
         <h3>Movie recommendation</h3>
-
-        <h3>Personal recommendations</h3>
         <div v-if="dataLoading" class="status">Loading recommendations...</div>
         <ul v-else class="movie-list">
-          <li v-for="cluster in recommendationClusters" :key="`cluster-${cluster.medoid}`" class="cluster-card">
-            <div class="cluster-header">
-              <strong>Cluster medoid</strong>
-              <span v-if="cluster.medoid_movie"> — {{ cluster.medoid_movie.title }}</span>
-            </div>
-            <ul class="movie-list">
-              <li v-for="movie in cluster.neighbors" :key="`rec-${movie.id}`" class="movie-card">
+              <li v-for="movie in recommendedMovies" :key="`rec-${movie.id}`" class="movie-card">
                 <img
                   v-if="getPosterSrc(movie)"
                   class="movie-poster"
@@ -400,11 +469,6 @@ async function openRecommendationTab() {
                   <button class="btn tiny" @click="likeAndRefresh(movie.id)">Like</button>
                 </div>
               </li>
-            </ul>
-          </li>
-          <li v-if="!recommendationClusters.length && !dataLoading" class="empty-state">
-            Add more likes to get personalized recommendations.
-          </li>
         </ul>
       </div>
 
