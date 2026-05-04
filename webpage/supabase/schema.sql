@@ -19,7 +19,6 @@ create table if not exists public.movies (
   genre1 text not null,
   genre2 text,
   genre3 text,
-  langauge text,
   like_count integer not null default 0
 );
 

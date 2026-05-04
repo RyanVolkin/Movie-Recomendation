@@ -26,7 +26,6 @@ async function getMovieById(id) {
 }
 router.get('/liked/count', async (req, res) => {
   const userId = sanitizeUserId(req.query.userId)
-  console.log('HIT /liked/count', { userId });
 
   if (!userId) {
     return res.status(400).json({ error: 'userId is required.' })
@@ -40,7 +39,6 @@ router.get('/liked/count', async (req, res) => {
     return res.status(500).json({ error: error.message })
   }
 
-  console.log('DEBUG liked/count:', { userId, count, data });
   return res.json({ count: count || 0 })
 });
 
@@ -308,32 +306,118 @@ router.post('/:id/unlike', async (req, res) => {
   return res.json({ unliked: true, movie: updatedMovie })
 })
 
-// (previous Python helper removed) JS helper below
+function parseVector(value) {
+  if (Array.isArray(value)) {
+    return value.map((n) => Number(n)).filter((n) => Number.isFinite(n))
+  }
 
-  async function runHdbscanJS(dataMatrix, minClusterSize = 2, minSamples = null) {
-    let hdbscanModule
+  if (typeof value === 'string') {
+    return value
+      .replace(/^\[|\]$/g, '')
+      .split(',')
+      .map((part) => Number(part.trim()))
+      .filter((n) => Number.isFinite(n))
+  }
 
-    try {
-      hdbscanModule = require('hdbscan')
-    } catch (e) {
-      throw new Error('JS HDBSCAN module not found. Please run `npm install hdbscan` in the backend folder.')
-    }
+  return []
+}
 
+function euclideanDistance(a, b) {
+  const length = Math.max(a.length, b.length)
+  let sum = 0
+
+  for (let index = 0; index < length; index += 1) {
+    const delta = (a[index] || 0) - (b[index] || 0)
+    sum += delta * delta
+  }
+
+  return Math.sqrt(sum)
+}
+
+async function runHdbscanJS(dataMatrix, minClusterSize = 2, minSamples = null) {
+  try {
+    const hdbscanModule = require('hdbscan')
     const HdbscanCtor = hdbscanModule.Hdbscan || hdbscanModule.default?.Hdbscan || hdbscanModule.default
 
     if (typeof HdbscanCtor !== 'function') {
-      throw new Error('Unsupported JS HDBSCAN module API. Expected an export named `Hdbscan`.')
+      return []
     }
 
     const instance = new HdbscanCtor(dataMatrix, minClusterSize, minSamples ?? minClusterSize)
 
     if (typeof instance.getClusters !== 'function') {
-      throw new Error('Unsupported JS HDBSCAN module API. Expected `getClusters()` on the Hdbscan instance.')
+      return []
     }
 
     const clusters = instance.getClusters()
-    return Array.isArray(clusters) ? clusters : []
+    return Array.isArray(clusters) ? clusters.filter((cluster) => Array.isArray(cluster) && cluster.length) : []
+  } catch (error) {
+    return []
   }
+}
+
+function buildCentroids(itemsByGenre) {
+  const centroids = {}
+
+  for (const [genre, vectors] of Object.entries(itemsByGenre)) {
+    if (!vectors.length) {
+      continue
+    }
+
+    const length = vectors[0].length
+    const centroid = new Array(length).fill(0)
+
+    for (const vector of vectors) {
+      for (let index = 0; index < length; index += 1) {
+        centroid[index] += vector[index] || 0
+      }
+    }
+
+    for (let index = 0; index < length; index += 1) {
+      centroid[index] /= vectors.length
+    }
+
+    centroids[genre] = centroid
+  }
+
+  return centroids
+}
+
+function medoidIndex(indices, vectors) {
+  if (indices.length <= 1) {
+    return indices[0] ?? 0
+  }
+
+  let bestIndex = indices[0]
+  let bestDistance = Infinity
+
+  for (const candidateIndex of indices) {
+    let totalDistance = 0
+
+    for (const otherIndex of indices) {
+      if (candidateIndex === otherIndex) {
+        continue
+      }
+
+      totalDistance += euclideanDistance(vectors[candidateIndex], vectors[otherIndex])
+    }
+
+    if (totalDistance < bestDistance) {
+      bestDistance = totalDistance
+      bestIndex = candidateIndex
+    }
+  }
+
+  return bestIndex
+}
+
+function toMovieLookup(rows) {
+  return (rows || []).reduce((lookup, row) => {
+    lookup[row.id] = row
+    return lookup
+  }, {})
+}
+
 router.get('/:id/recommend', async (req, res) => {
   const userId = sanitizeUserId(req.params.id)
 
@@ -341,11 +425,8 @@ router.get('/:id/recommend', async (req, res) => {
     return res.status(400).json({ error: 'userId is required.' })
   }
 
-  const limitPerCluster = Math.max(Number.parseInt(req.query.limitPerCluster, 10) || 5, 1)
   const minClusterSize = Math.max(Number.parseInt(req.query.minClusterSize, 10) || 2, 1)
-  const minSamples = req.query.minSamples !== undefined ? Number.parseInt(req.query.minSamples, 10) : null
 
-  // Get liked movie ids
   const { data: likes, error: likesError } = await supabaseAdmin
     .from('user_movie_likes')
     .select('movie_id')
@@ -355,320 +436,234 @@ router.get('/:id/recommend', async (req, res) => {
     return res.status(500).json({ error: likesError.message })
   }
 
-  const likedIds = (likes || []).map((r) => r.movie_id)
+  const likedIds = [...new Set((likes || []).map((row) => row.movie_id).filter(Boolean))]
 
   if (!likedIds.length) {
     return res.status(400).json({ error: 'No liked movies found for user.' })
   }
 
-  // Fetch vectors for liked movies
-  const { data: likedVectorsData, error: vectorsError } = await supabaseAdmin
-    .from('movie_vectors')
-    .select('tconst,genre_vector')
-    .in('tconst', likedIds)
+  const [likedVectorsResponse, likedDetailsResponse] = await Promise.all([
+    supabaseAdmin.from('movie_vectors').select('tconst,genre_vector').in('tconst', likedIds),
+    supabaseAdmin.from('movies').select('tconst,genre1,genre2,genre3,release_year,numratings').in('tconst', likedIds),
+  ])
 
-  if (vectorsError) {
-    return res.status(500).json({ error: vectorsError.message })
+  if (likedVectorsResponse.error) {
+    return res.status(500).json({ error: likedVectorsResponse.error.message })
   }
 
-  function parseVector(v) {
-    let arr = []
-    if (Array.isArray(v)) {
-      arr = v.map((n) => Number(n))
-    } else if (typeof v === 'string') {
-      // Remove only leading [ and trailing ]
-      arr = v.replace(/^\[|\]$/g, '').split(',').map((s) => Number(s))
-    }
-    return arr
+  if (likedDetailsResponse.error) {
+    return res.status(500).json({ error: likedDetailsResponse.error.message })
   }
 
-  const likedVectors = likedVectorsData.map((r) => ({ tconst: r.tconst, vector: parseVector(r.genre_vector) }))
+  const likedVectors = (likedVectorsResponse.data || [])
+    .map((row) => ({ tconst: row.tconst, vector: parseVector(row.genre_vector) }))
+    .filter((row) => row.vector.length)
 
   if (!likedVectors.length) {
     return res.status(400).json({ error: 'No vectors available for liked movies.' })
   }
 
-  // Synthetic generation: create synthetic variants by swapping genres toward
-  // the user's most-liked genres, then blend vectors toward the genre centroids.
-  const SYNTH_K = 10 // max synthetic variants per liked movie
-  const SYNTH_BLEND_AMOUNT = 0.45
+  const likedDetailsById = toMovieLookup(likedDetailsResponse.data || [])
+  const likedVectorById = likedVectors.reduce((lookup, row) => {
+    lookup[row.tconst] = row.vector
+    return lookup
+  }, {})
 
-  function blendVectors(source, target, amount) {
-    const length = Math.max(source.length, target.length)
-    const out = new Array(length)
-    for (let i = 0; i < length; i += 1) {
-      const s = source[i] || 0
-      const t = target[i] || 0
-      out[i] = s + amount * (t - s)
-    }
-    return out
-  }
+  const likedYears = (likedDetailsResponse.data || [])
+    .map((movie) => Number(movie.release_year))
+    .filter((year) => Number.isFinite(year))
+  const minLikedYear = likedYears.length ? Math.min(...likedYears) : null
 
-  function euclidean(a, b) {
-    let s = 0
-    const len = Math.max(a.length, b.length)
-    for (let i = 0; i < len; i += 1) {
-      const d = (a[i] || 0) - (b[i] || 0)
-      s += d * d
-    }
-    return Math.sqrt(s)
-  }
+  const likedNumRatings = (likedDetailsResponse.data || [])
+    .map((movie) => Number(movie.numratings))
+    .filter((numRatings) => Number.isFinite(numRatings))
+  const minLikedNumRatings = likedNumRatings.length ? Math.min(...likedNumRatings) : null
 
-  // Synthetic generation: create interpolated vectors between liked vectors
-  // and popular genre centroids across multiple blend steps. Produces a
-  // smooth range of candidates per genre without persisting new movies.
-  const SYNTH_STEPS = 20
-  const SYNTH_STEP = 0.05
-  const MAX_SYNTH_TOTAL = 400
-
-
-  // Load liked movie genres, years
-  const { data: likedMovieDetails, error: likedMovieDetailsError } = await supabaseAdmin
-    .from('movies')
-    .select('tconst,genre1,genre2,genre3,release_year')
-    .in('tconst', likedIds)
-
-  if (likedMovieDetailsError) {
-    return res.status(500).json({ error: likedMovieDetailsError.message })
-  }
-
-  const genreCounts = {}
   const genreVectors = {}
-  const vectById = {}
-  for (const lv of likedVectors) vectById[lv.tconst] = lv.vector
+  const genreCounts = {}
+  const genresByMovieId = {}
 
-  const movieGenresById = {}
-  for (const m of likedMovieDetails || []) {
-    const genres = [m.genre1, m.genre2, m.genre3].filter(Boolean).map((g) => g.trim())
-    movieGenresById[m.tconst] = genres
-    const vec = vectById[m.tconst]
-    for (const g of genres) {
-      genreCounts[g] = (genreCounts[g] || 0) + 1
-      if (vec) {
-        if (!genreVectors[g]) genreVectors[g] = []
-        genreVectors[g].push(vec)
+  for (const likedMovie of likedDetailsResponse.data || []) {
+    const genres = [likedMovie.genre1, likedMovie.genre2, likedMovie.genre3]
+      .filter((genre) => typeof genre === 'string' && genre.trim())
+      .map((genre) => genre.trim())
+
+    genresByMovieId[likedMovie.tconst] = genres
+
+    const vector = likedVectorById[likedMovie.tconst]
+    for (const genre of genres) {
+      genreCounts[genre] = (genreCounts[genre] || 0) + 1
+      if (!vector) {
+        continue
       }
+
+      if (!genreVectors[genre]) {
+        genreVectors[genre] = []
+      }
+
+      genreVectors[genre].push(vector)
     }
   }
 
-  const genreCentroids = {}
-  for (const [g, vecs] of Object.entries(genreVectors)) {
-    const L = vecs.length
-    if (!L) continue
-    const len = vecs[0].length
-    const avg = new Array(len).fill(0)
-    for (const v of vecs) {
-      for (let i = 0; i < len; i += 1) avg[i] += (v[i] || 0)
-    }
-    for (let i = 0; i < len; i += 1) avg[i] /= L
-    genreCentroids[g] = avg
-  }
+  const genreCentroids = buildCentroids(genreVectors)
+  const topGenres = Object.entries(genreCounts)
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 5)
+    .map(([genre]) => genre)
 
-  const popularityList = Object.keys(genreCounts).sort((a, b) => genreCounts[b] - genreCounts[a])
-
+  const SYTHETIC_K = 8
+  const GLOBAL_SYNTHETIC_CAP = 100
   const syntheticVectors = []
-  let synthCount = 0
+  const syntheticBlend = 0.35
+  const syntheticCountByMovie = {}
 
-  // For each popular genre, interpolate between a set of base vectors and the
-  // genre centroid at multiple blend weights to produce a smooth range.
-  for (const genre of popularityList) {
-    if (synthCount >= MAX_SYNTH_TOTAL) break
+  for (const genre of topGenres) {
     const centroid = genreCentroids[genre]
     if (!centroid) continue
 
-    // Base vectors: prefer liked movies that do NOT already have this genre
-    const baseVecs = likedVectors.filter((lv) => {
-      const g = movieGenresById[lv.tconst] || []
-      return !g.includes(genre)
-    })
-    // Fallback to using all liked vectors if none without the genre
-    const candidates = baseVecs.length ? baseVecs : likedVectors
+    for (const likedVector of likedVectors) {
+      if (syntheticVectors.length >= GLOBAL_SYNTHETIC_CAP) break
 
-    for (const b of candidates) {
-      if (synthCount >= MAX_SYNTH_TOTAL) break
-      for (let step = 1; step <= SYNTH_STEPS; step += 1) {
-        const weight = Math.min(1 - 1e-6, step * SYNTH_STEP)
-        if (weight <= 0) continue
-        const synth = blendVectors(b.vector, centroid, weight)
-        syntheticVectors.push({ tconst: null, vector: synth })
-        synthCount += 1
-        if (synthCount >= MAX_SYNTH_TOTAL) break
-      }
+      const movieId = likedVector.tconst
+      const genres = genresByMovieId[movieId] || []
+      if (genres.includes(genre)) continue
+
+      const currentCount = syntheticCountByMovie[movieId] || 0
+      if (currentCount >= SYTHETIC_K) continue
+
+      syntheticVectors.push({
+        tconst: null,
+        vector: likedVector.vector.map((value, index) => value + syntheticBlend * ((centroid[index] || 0) - value)),
+      })
+
+      syntheticCountByMovie[movieId] = currentCount + 1
     }
+
+    if (syntheticVectors.length >= GLOBAL_SYNTHETIC_CAP) break
   }
 
   const augmentedVectors = [...likedVectors, ...syntheticVectors]
-  const dataMatrix = augmentedVectors.map((r) => r.vector)
+  const dataMatrix = augmentedVectors.map((row) => row.vector)
+  const clusters = (await runHdbscanJS(dataMatrix, minClusterSize, SYTHETIC_K * 1.5)).filter((cluster) => cluster.length >= minClusterSize)
+  const clusterList = clusters.length ? clusters : [dataMatrix.map((_, index) => index)]
 
-  // Cluster liked vectors using HDBSCAN (JS) with console.log suppressed
-  let clusters = []
-  const originalLog = console.log;
-  console.log = () => {};
-  try {
-    clusters = await runHdbscanJS(dataMatrix, SYNTH_K, minSamples ?? minClusterSize)
-  } catch (e) {
-    clusters = []
-  } finally {
-    console.log = originalLog;
-  }
-  console.log(clusters);
-  if (!clusters || !clusters.length) {
-    clusters = [dataMatrix.map((_, i) => i)]
-  }
+  const candidateMap = new Map()
+  const likedIdSet = new Set(likedIds)
 
-  function medoidIndex(indices) {
-    if (indices.length === 1) return indices[0]
-        // Debug: log best5
-    let best = indices[0]
-    let bestSum = Infinity
-    for (const i of indices) {
-      let sum = 0
-      for (const j of indices) {
-        if (i === j) continue
-        sum += euclidean(dataMatrix[i], dataMatrix[j])
-      }
-      if (sum < bestSum) {
-        bestSum = sum
-        best = i
-      }
+  for (const clusterIndices of clusterList) {
+    const medoidIdx = medoidIndex(clusterIndices, dataMatrix)
+    const repVec = augmentedVectors[medoidIdx]?.vector
+
+    if (!repVec || !repVec.length) {
+      continue
     }
-    return best
-  }
 
-  // Collect all candidates from all clusters
-  let allCandidates = [];
-  let allTconsts = new Set();
-
-  for (const clusterIndices of clusters) {
-    const medoidIdx = medoidIndex(clusterIndices);
-    const repVec = augmentedVectors[medoidIdx].vector;
-    const { data: closest50, error: rpcError } = await supabaseAdmin.rpc('match_movies', {
+    const { data: matches, error: rpcError } = await supabaseAdmin.rpc('match_movies', {
       query_embedding: repVec,
-      match_threshold: 0.7,
-      match_count: 50,
-    });
+      match_threshold: 0.5,
+      match_count: 20,
+      min_release_year: minLikedYear === null ? null : minLikedYear - 5,
+      min_numratings: minLikedNumRatings === null ? null : Math.ceil(minLikedNumRatings * 0.8),
+    })
+
     if (rpcError) {
-      return res.status(500).json({ error: rpcError.message });
+      return res.status(500).json({ error: rpcError.message })
     }
-    function clusterFitScore(candidateVec, clusterIndices) {
-      let sum = 0;
-      for (const idx of clusterIndices) {
-        sum += euclidean(candidateVec, dataMatrix[idx]);
+
+    for (const match of matches || []) {
+      if (!match?.tconst || likedIdSet.has(match.tconst) || candidateMap.has(match.tconst)) {
+        continue
       }
-      return sum;
-    }
-    const withFit = (closest50 || []).map((entry) => {
-      const vector = Array.isArray(entry.vector)
-        ? entry.vector
-        : (typeof entry.vector === 'string' ? parseVector(entry.vector) : []);
-      return {
-        tconst: entry.tconst,
+
+      const vector = parseVector(match.vector)
+      if (!vector.length) {
+        continue
+      }
+
+      const fitScore = clusterIndices.reduce(
+        (sum, clusterIndex) => sum + euclideanDistance(vector, dataMatrix[clusterIndex]),
+        0,
+      )
+
+      candidateMap.set(match.tconst, {
+        tconst: match.tconst,
         vector,
-        fitScore: clusterFitScore(vector, clusterIndices)
-      };
-    });
-    for (const item of withFit) {
-      if (!likedIds.includes(item.tconst) && !allTconsts.has(item.tconst)) {
-        item.clusterSize = clusterIndices.length;
-        allCandidates.push(item);
-        allTconsts.add(item.tconst);
-      }
+        fitScore,
+        clusterSize: clusterIndices.length,
+      })
     }
   }
 
-  // Fetch movie details for all candidates
-  const tconstsToFetch = Array.from(allTconsts);
+  const candidates = [...candidateMap.values()]
+
+  if (!candidates.length) {
+    return res.json({ neighbors: [] })
+  }
+
+  const candidateIds = candidates.map((candidate) => candidate.tconst)
   const { data: movieDetails, error: movieDetailsError } = await supabaseAdmin
     .from('movies')
     .select(MOVIE_SELECT)
-    .in('tconst', tconstsToFetch);
+    .in('tconst', candidateIds)
+
   if (movieDetailsError) {
-    return res.status(500).json({ error: movieDetailsError.message });
+    return res.status(500).json({ error: movieDetailsError.message })
   }
 
-  // Filter candidates to only those that share a with a liked movie
-  const filteredCandidates = allCandidates.filter(item => {
-    const details = movieDetails.find(m => m.id === item.tconst);
-    return details
-  });
-  // Compute liked-year stats for outlier detection
-  const likedYears = (likedMovieDetails || [])
-    .map((m) => Number(m.release_year))
-    .filter((y) => Number.isFinite(y))
+  const movieDetailsById = toMovieLookup(movieDetails || [])
 
-  let yearMean = 0
-  let yearStd = 0
-  if (likedYears.length >= 2) {
-    yearMean = likedYears.reduce((s, v) => s + v, 0) / likedYears.length
-    const variance = likedYears.reduce((s, v) => s + Math.pow(v - yearMean, 2), 0) / (likedYears.length - 1)
-    yearStd = Math.sqrt(variance)
-  }
+  let filteredCandidates = candidates.filter((candidate) => movieDetailsById[candidate.tconst])
 
-  const YEAR_Z_THRESHOLD = 2.0
-  const YEAR_PENALTY = .25
-
-  // Compute liked-rating stats for outlier detection
-  const likedRatings = (likedMovieDetails || [])
-    .map((m) => {
-      const r = movieDetails.find((d) => d.id === m.tconst)
-      return r ? Number(r.rating) : null
+  if (minLikedYear !== null) {
+    filteredCandidates = filteredCandidates.filter((candidate) => {
+      const details = movieDetailsById[candidate.tconst]
+      return Number(details.release_year) >= minLikedYear - 5
     })
-    .filter((r) => Number.isFinite(r))
-
-  let ratingMean = 0
-  let ratingStd = 0
-  if (likedRatings.length >= 2) {
-    ratingMean = likedRatings.reduce((s, v) => s + v, 0) / likedRatings.length
-    const variance = likedRatings.reduce((s, v) => s + Math.pow(v - ratingMean, 2), 0) / (likedRatings.length - 1)
-    ratingStd = Math.sqrt(variance)
   }
 
-  const RATING_Z_THRESHOLD = 2.0
-  const RATING_PENALTY = .4
+  if (minLikedNumRatings !== null) {
+    filteredCandidates = filteredCandidates.filter((candidate) => {
+      const details = movieDetailsById[candidate.tconst]
+      return Number(details.numratings) >= minLikedNumRatings * 0.8
+    })
+  }
 
-  // Add rating and yearOutlier flag to each candidate
-  let candidatesToScore = filteredCandidates;
-  candidatesToScore = candidatesToScore.map((item) => {
-    const details = movieDetails.find((m) => m.id === item.tconst)
-    const rating = details ? details.rating : 0
-    let yearOutlier = false
-    const year = details && details.release_year ? Number(details.release_year) : NaN
-    if (likedYears.length >= 2 && Number.isFinite(year) && yearStd > 0) {
-      const z = Math.abs(year - yearMean) / yearStd
-      yearOutlier = z > YEAR_Z_THRESHOLD
-    }
-    return { ...item, rating, yearOutlier }
-  })
-  // Normalize fitScore to 0-1 (0=close, 1=far)
-  const fitScores = candidatesToScore.map((item) => item.fitScore)
+  if (!filteredCandidates.length) {
+    return res.json({ neighbors: [] })
+  }
+
+  const fitScores = filteredCandidates.map((candidate) => candidate.fitScore)
   const minFit = Math.min(...fitScores)
   const maxFit = Math.max(...fitScores)
-  candidatesToScore.forEach((item) => {
-    if (maxFit !== minFit) {
-      item.normFitScore = (item.fitScore - minFit) / (maxFit - minFit)
-    } else {
-      item.normFitScore = 0
-    }
-  })
-  // Sort using (rating)^(1-normFitScore) with year-outlier penalty applied
-  candidatesToScore.sort((a, b) => {
-    const aScoreBase = Math.pow(a.rating || 0, 1 - a.normFitScore)
-    const bScoreBase = Math.pow(b.rating || 0, 1 - b.normFitScore)
-    const aAdj = aScoreBase * (a.yearOutlier ? YEAR_PENALTY : 1)
-    const bAdj = bScoreBase * (b.yearOutlier ? YEAR_PENALTY : 1)
-    return bAdj - aAdj
-  })
-  // Return top 10 neighbors
-  const top10 = candidatesToScore.slice(0, 10).map(item => {
-    const details = movieDetails.find(m => m.id === item.tconst);
-    return {
-      ...details,
-      fit_score: item.fitScore,
-      norm_fit_score: item.normFitScore,
-      rating: item.rating
-    };
-  }).filter(Boolean);
-  return res.json({ neighbors: top10 });
+
+  const scoredCandidates = filteredCandidates
+    .map((candidate) => {
+      const details = movieDetailsById[candidate.tconst]
+      const rating = Number(details.rating) || 0
+      const normFitScore = maxFit === minFit ? 0 : (candidate.fitScore - minFit) / (maxFit - minFit)
+      const score = rating * (1 - normFitScore)
+
+      return {
+        ...details,
+        fit_score: candidate.fitScore,
+        norm_fit_score: normFitScore,
+        cluster_size: candidate.clusterSize,
+        score,
+      }
+    })
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score
+      }
+
+      if ((right.rating || 0) !== (left.rating || 0)) {
+        return (right.rating || 0) - (left.rating || 0)
+      }
+
+      return left.fit_score - right.fit_score
+    })
+
+  return res.json({ neighbors: scoredCandidates.slice(0, 10) })
 })
 
 module.exports = router

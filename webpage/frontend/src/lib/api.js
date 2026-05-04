@@ -59,10 +59,5 @@ export function unlikeMovie(id, userId) {
 }
 
 export function fetchRecommendations(userId, options = {}) {
-  const limitPerCluster = options.limitPerCluster ?? 5
-  const eps = options.eps ?? 0.5
-  const minPts = options.minPts ?? 2
-
-  const qs = `?limitPerCluster=${encodeURIComponent(limitPerCluster)}&eps=${encodeURIComponent(eps)}&minPts=${encodeURIComponent(minPts)}`
-  return request(`/movies/${encodeURIComponent(userId)}/recommend${qs}`)
+  return request(`/movies/${encodeURIComponent(userId)}/recommend`)
 }
