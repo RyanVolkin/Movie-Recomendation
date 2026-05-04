@@ -418,7 +418,26 @@ function toMovieLookup(rows) {
   }, {})
 }
 
+function logTiming(label, startTime) {
+  // Debug timing output removed
+  return Date.now()
+}
+
+async function runHdbscanJSQuiet(dataMatrix, minClusterSize = 2, minSamples = null) {
+  const originalLog = console.log
+  const originalWarn = console.warn
+  try {
+    console.log = () => {}
+    console.warn = () => {}
+    return await runHdbscanJS(dataMatrix, minClusterSize, minSamples)
+  } finally {
+    console.log = originalLog
+    console.warn = originalWarn
+  }
+}
+
 router.get('/:id/recommend', async (req, res) => {
+  const startTime = Date.now()
   const userId = sanitizeUserId(req.params.id)
 
   if (!userId) {
@@ -442,10 +461,13 @@ router.get('/:id/recommend', async (req, res) => {
     return res.status(400).json({ error: 'No liked movies found for user.' })
   }
 
+  let currentTime = Date.now()
   const [likedVectorsResponse, likedDetailsResponse] = await Promise.all([
     supabaseAdmin.from('movie_vectors').select('tconst,genre_vector').in('tconst', likedIds),
     supabaseAdmin.from('movies').select('tconst,genre1,genre2,genre3,release_year,numratings').in('tconst', likedIds),
   ])
+
+  currentTime = logTiming('Fetch liked vectors & details', currentTime)
 
   if (likedVectorsResponse.error) {
     return res.status(500).json({ error: likedVectorsResponse.error.message })
@@ -505,11 +527,15 @@ router.get('/:id/recommend', async (req, res) => {
     }
   }
 
+  currentTime = logTiming('Build genre lookups', currentTime)
+
   const genreCentroids = buildCentroids(genreVectors)
   const topGenres = Object.entries(genreCounts)
     .sort((left, right) => right[1] - left[1])
     .slice(0, 5)
     .map(([genre]) => genre)
+
+  currentTime = logTiming('Build genre centroids', currentTime)
 
   const GLOBAL_SYNTHETIC_CAP = 100
   const SYTHETIC_K = Math.max(1, Math.min(8, Math.floor(GLOBAL_SYNTHETIC_CAP / likedVectors.length)))
@@ -539,34 +565,51 @@ router.get('/:id/recommend', async (req, res) => {
     }
   }
 
+  currentTime = logTiming('Generate synthetic vectors', currentTime)
+
   const augmentedVectors = [...likedVectors, ...syntheticVectors]
   const dataMatrix = augmentedVectors.map((row) => row.vector)
-  const clusters = (await runHdbscanJS(dataMatrix, SYTHETIC_K * 1.5))
-  const clusterList = clusters.length ? clusters : [dataMatrix.map((_, index) => index)]
+  const clusters = (await runHdbscanJSQuiet(dataMatrix, SYTHETIC_K * 1.5)) 
+  currentTime = logTiming('HDBSCAN clustering', currentTime)
+    const clusterList = clusters.length ? clusters : [dataMatrix.map((_, index) => index)]
 
   const candidateMap = new Map()
   const likedIdSet = new Set(likedIds)
+  let rpcCallCount = 0
 
-  for (const clusterIndices of clusterList) {
-    const medoidIdx = medoidIndex(clusterIndices, dataMatrix)
-    const repVec = augmentedVectors[medoidIdx]?.vector
+  const rpcPromises = clusterList
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 5)
+    .map((clusterIndices) => {
+      const medoidIdx = medoidIndex(clusterIndices, dataMatrix)
+      const repVec = augmentedVectors[medoidIdx]?.vector
 
-    if (!repVec || !repVec.length) {
-      continue
-    }
+      if (!repVec || !repVec.length) {
+        return Promise.resolve(null)
+      }
 
-    const { data: matches, error: rpcError } = await supabaseAdmin.rpc('match_movies', {
-      query_embedding: repVec,
-      match_threshold: 0.5,
-      match_count: 20,
-      min_release_year: minLikedYear === null ? null : minLikedYear - 5,
-      min_numratings: minLikedNumRatings === null ? null : Math.ceil(minLikedNumRatings * 0.8),
+      return supabaseAdmin.rpc('match_movies', {
+        query_embedding: repVec,
+        match_threshold: 0.5,
+        match_count: 10,
+        min_release_year: minLikedYear === null ? null : minLikedYear - 5,
+        min_numratings: minLikedNumRatings === null ? null : Math.ceil(minLikedNumRatings * 0.8),
+      }).then(result => ({ clusterIndices, result }))
     })
+
+  const rpcResults = await Promise.all(rpcPromises)
+
+  for (const rpcData of rpcResults) {
+    if (!rpcData) continue
+
+    const { clusterIndices, result } = rpcData
+    const { data: matches, error: rpcError } = result
 
     if (rpcError) {
       return res.status(500).json({ error: rpcError.message })
     }
 
+    rpcCallCount++
     for (const match of matches || []) {
       if (!match?.tconst || likedIdSet.has(match.tconst) || candidateMap.has(match.tconst)) {
         continue
@@ -590,6 +633,8 @@ router.get('/:id/recommend', async (req, res) => {
     }
   }
 
+  currentTime = logTiming(`RPC calls (${rpcCallCount} clusters)`, currentTime)
+
   const candidates = [...candidateMap.values()]
 
   if (!candidates.length) {
@@ -605,6 +650,8 @@ router.get('/:id/recommend', async (req, res) => {
   if (movieDetailsError) {
     return res.status(500).json({ error: movieDetailsError.message })
   }
+
+  currentTime = logTiming('Fetch candidate movie details', currentTime)
 
   const movieDetailsById = toMovieLookup(movieDetails || [])
 
@@ -623,6 +670,8 @@ router.get('/:id/recommend', async (req, res) => {
       return Number(details.numratings) >= minLikedNumRatings * 0.8
     })
   }
+
+  currentTime = logTiming('Apply year/numratings filters', currentTime)
 
   if (!filteredCandidates.length) {
     return res.json({ neighbors: [] })
@@ -658,7 +707,12 @@ router.get('/:id/recommend', async (req, res) => {
       return left.fit_score - right.fit_score
     })
 
-  return res.json({ neighbors: scoredCandidates.slice(0, 10) })
+
+  currentTime = logTiming('Score and sort candidates', currentTime)
+  const finalResult = scoredCandidates.slice(0, 10)
+  logTiming('TOTAL RECOMMEND REQUEST', startTime)
+
+  return res.json({ neighbors: finalResult })
 })
 
 module.exports = router
