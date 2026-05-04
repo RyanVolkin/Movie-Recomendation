@@ -464,7 +464,7 @@ router.get('/:id/recommend', async (req, res) => {
   let currentTime = Date.now()
   const [likedVectorsResponse, likedDetailsResponse] = await Promise.all([
     supabaseAdmin.from('movie_vectors').select('tconst,genre_vector').in('tconst', likedIds),
-    supabaseAdmin.from('movies').select('tconst,genre1,genre2,genre3,release_year,numratings').in('tconst', likedIds),
+    supabaseAdmin.from('movies').select('tconst,genre1,genre2,genre3,release_year,numratings,language').in('tconst', likedIds),
   ])
 
   currentTime = logTiming('Fetch liked vectors & details', currentTime)
@@ -486,6 +486,14 @@ router.get('/:id/recommend', async (req, res) => {
   }
 
   const likedDetailsById = toMovieLookup(likedDetailsResponse.data || [])
+
+  // Collect all languages from liked movies
+  const likedLanguages = new Set(
+    (likedDetailsResponse.data || [])
+      .map((movie) => movie.language)
+      .filter((lang) => typeof lang === 'string' && lang.trim())
+      .map((lang) => lang.trim())
+  )
   const likedVectorById = likedVectors.reduce((lookup, row) => {
     lookup[row.tconst] = row.vector
     return lookup
@@ -644,7 +652,7 @@ router.get('/:id/recommend', async (req, res) => {
   const candidateIds = candidates.map((candidate) => candidate.tconst)
   const { data: movieDetails, error: movieDetailsError } = await supabaseAdmin
     .from('movies')
-    .select(MOVIE_SELECT)
+    .select(MOVIE_SELECT + ',language')
     .in('tconst', candidateIds)
 
   if (movieDetailsError) {
@@ -656,6 +664,13 @@ router.get('/:id/recommend', async (req, res) => {
   const movieDetailsById = toMovieLookup(movieDetails || [])
 
   let filteredCandidates = candidates.filter((candidate) => movieDetailsById[candidate.tconst])
+
+  // Filter out movies whose language is not in likedLanguages
+  filteredCandidates = filteredCandidates.filter((candidate) => {
+    const details = movieDetailsById[candidate.tconst]
+    const lang = typeof details.language === 'string' ? details.language.trim() : ''
+    return !lang || likedLanguages.has(lang)
+  })
 
   if (minLikedYear !== null) {
     filteredCandidates = filteredCandidates.filter((candidate) => {
