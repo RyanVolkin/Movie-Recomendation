@@ -5,8 +5,6 @@ const router = express.Router()
 const MOVIE_SELECT =
   'id:tconst,title,release_year,runtime,rating,numratings,genre1,genre2,genre3,likes_count:like_count'
 
-// Using JS HDBSCAN loader below
-
 function sanitizeUserId(value) {
   if (typeof value !== 'string') {
     return ''
@@ -334,6 +332,89 @@ function euclideanDistance(a, b) {
   return Math.sqrt(sum)
 }
 
+function cosineSimilarity(vec1, vec2) {
+  if (!vec1 || !vec2 || vec1.length !== vec2.length) {
+    return 0
+  }
+
+  let dotProduct = 0
+  let norm1 = 0
+  let norm2 = 0
+
+  for (let i = 0; i < vec1.length; i += 1) {
+    dotProduct += vec1[i] * vec2[i]
+    norm1 += vec1[i] * vec1[i]
+    norm2 += vec2[i] * vec2[i]
+  }
+
+  const denominator = Math.sqrt(norm1) * Math.sqrt(norm2)
+  if (denominator === 0) return 0
+
+  return dotProduct / denominator
+}
+
+function findKNN(queryVector, dataMatrix, metadata = null, k = 10, metric = 'euclidean') {
+  if (!queryVector || !dataMatrix || dataMatrix.length === 0) {
+    return []
+  }
+
+  const distances = []
+
+  for (let i = 0; i < dataMatrix.length; i += 1) {
+    const distance = metric === 'cosine'
+      ? -cosineSimilarity(queryVector, dataMatrix[i])
+      : euclideanDistance(queryVector, dataMatrix[i])
+
+    distances.push({
+      index: i,
+      distance,
+      metadata: metadata ? metadata[i] : null,
+    })
+  }
+
+  distances.sort((a, b) => a.distance - b.distance)
+
+  return distances.slice(0, Math.min(k, distances.length))
+}
+
+function findApproximateKNN(queryVector, dataMatrix, metadata = null, k = 10, searchRadius = 0.1, metric = 'euclidean') {
+  const neighbors = findKNN(queryVector, dataMatrix, metadata, k, metric)
+
+  if (neighbors.length < k && dataMatrix.length > k * 10) {
+    const expandedNeighbors = findKNN(queryVector, dataMatrix, metadata, Math.min(dataMatrix.length, Math.ceil(k * 5)), metric)
+    return expandedNeighbors.slice(0, k)
+  }
+
+  return neighbors
+}
+
+function findAggregatedKNN(queryVectors, dataMatrix, metadata = null, k = 10, metric = 'euclidean') {
+  const aggregatedResults = new Map()
+
+  for (const queryVector of queryVectors) {
+    const neighbors = findKNN(queryVector, dataMatrix, metadata, k, metric)
+
+    for (const neighbor of neighbors) {
+      if (!aggregatedResults.has(neighbor.index)) {
+        aggregatedResults.set(neighbor.index, {
+          metadata: neighbor.metadata,
+          totalDistance: 0,
+          count: 0,
+        })
+      }
+
+      const current = aggregatedResults.get(neighbor.index)
+      current.totalDistance += neighbor.distance
+      current.count += 1
+    }
+  }
+
+  const sorted = [...aggregatedResults.entries()]
+    .sort((a, b) => (a[1].totalDistance / a[1].count) - (b[1].totalDistance / b[1].count))
+
+  return new Map(sorted)
+}
+
 async function runHdbscanJS(dataMatrix, minClusterSize = 2, minSamples = null) {
   try {
     const hdbscanModule = require('hdbscan')
@@ -355,6 +436,67 @@ async function runHdbscanJS(dataMatrix, minClusterSize = 2, minSamples = null) {
     return []
   }
 }
+
+function kMeans(dataMatrix, k = 4, maxIterations = 100) {
+  if (!dataMatrix.length) return []
+
+  k = Math.min(k, dataMatrix.length)
+
+  let centroids = dataMatrix.slice(0, k).map(vector => [...vector])
+  let assignments = new Array(dataMatrix.length).fill(-1)
+
+  for (let iter = 0; iter < maxIterations; iter += 1) {
+    let changed = false
+
+    for (let i = 0; i < dataMatrix.length; i += 1) {
+      let bestCluster = 0
+      let bestDistance = Infinity
+
+      for (let c = 0; c < centroids.length; c += 1) {
+        const distance = euclideanDistance(dataMatrix[i], centroids[c])
+        if (distance < bestDistance) {
+          bestDistance = distance
+          bestCluster = c
+        }
+      }
+
+      if (assignments[i] !== bestCluster) {
+        assignments[i] = bestCluster
+        changed = true
+      }
+    }
+
+    if (!changed) break
+
+    const sums = centroids.map(() => new Array(dataMatrix[0].length).fill(0))
+    const counts = centroids.map(() => 0)
+
+    for (let i = 0; i < dataMatrix.length; i += 1) {
+      const cluster = assignments[i]
+      counts[cluster] += 1
+
+      for (let j = 0; j < dataMatrix[i].length; j += 1) {
+        sums[cluster][j] += dataMatrix[i][j]
+      }
+    }
+
+    for (let c = 0; c < centroids.length; c += 1) {
+      if (counts[c] === 0) continue
+
+      for (let j = 0; j < centroids[c].length; j += 1) {
+        centroids[c][j] = sums[c][j] / counts[c]
+      }
+    }
+  }
+
+  return centroids.map((centroid, clusterIndex) => ({
+    centroid,
+    indices: assignments
+      .map((assignment, index) => assignment === clusterIndex ? index : -1)
+      .filter(index => index !== -1),
+  }))
+}
+
 
 function buildCentroids(itemsByGenre) {
   const centroids = {}
@@ -439,9 +581,14 @@ async function runHdbscanJSQuiet(dataMatrix, minClusterSize = 2, minSamples = nu
 router.get('/:id/recommend', async (req, res) => {
   const startTime = Date.now()
   const userId = sanitizeUserId(req.params.id)
+  const method = (req.query.method || 'hdbscan').toLowerCase()
 
   if (!userId) {
     return res.status(400).json({ error: 'userId is required.' })
+  }
+
+  if (!['hdbscan', 'knn', 'kmeans'].includes(method)) {
+    return res.status(400).json({ error: 'method must be "hdbscan", "knn", or "kmeans"' })
   }
 
   const minClusterSize = Math.max(Number.parseInt(req.query.minClusterSize, 10) || 2, 1)
@@ -575,26 +722,89 @@ router.get('/:id/recommend', async (req, res) => {
 
   currentTime = logTiming('Generate synthetic vectors', currentTime)
 
-  const augmentedVectors = [...likedVectors, ...syntheticVectors]
-  const dataMatrix = augmentedVectors.map((row) => row.vector)
-  const clusters = (await runHdbscanJSQuiet(dataMatrix, SYTHETIC_K * 1.5)) 
-  currentTime = logTiming('HDBSCAN clustering', currentTime)
-    const clusterList = clusters.length ? clusters : [dataMatrix.map((_, index) => index)]
-
-  const candidateMap = new Map()
   const likedIdSet = new Set(likedIds)
-  let rpcCallCount = 0
+  let candidateMap = new Map()
+  let candidates = []
 
-  const rpcPromises = clusterList
-    .sort((a, b) => b.length - a.length)
-    .slice(0, 5)
-    .map((clusterIndices) => {
-      const medoidIdx = medoidIndex(clusterIndices, dataMatrix)
-      const repVec = augmentedVectors[medoidIdx]?.vector
+  if (method === 'knn') {
+    // KNN approach: find k nearest neighbors for each liked vector across entire database
+    const k = Math.min(
+      Math.max(Number.parseInt(req.query.k, 10) || 20, 1),
+      100
+    )
+    let rpcCallCount = 0
 
-      if (!repVec || !repVec.length) {
-        return Promise.resolve(null)
+    const knnPromises = likedVectors.map((likedVector) => {
+      return supabaseAdmin.rpc('match_movies', {
+        query_embedding: likedVector.vector,
+        match_threshold: 0.0,
+        match_count: k,
+        min_release_year: minLikedYear === null ? null : minLikedYear - 5,
+        min_numratings: minLikedNumRatings === null ? null : Math.ceil(minLikedNumRatings * 0.8),
+      }).then(result => ({ likedId: likedVector.tconst, result }))
+    })
+
+    const knnResults = await Promise.all(knnPromises)
+
+    // Aggregate results from all KNN queries
+    for (const { likedId, result } of knnResults) {
+      const { data: matches, error: rpcError } = result
+
+      if (rpcError) {
+        return res.status(500).json({ error: rpcError.message })
       }
+
+      rpcCallCount++
+      for (const match of matches || []) {
+        if (!match?.tconst || likedIdSet.has(match.tconst)) {
+          continue
+        }
+
+        const vector = parseVector(match.vector)
+        if (!vector.length) {
+          continue
+        }
+
+        const distance = euclideanDistance(vector, likedVectors.find(v => v.tconst === likedId)?.vector || [])
+
+        if (!candidateMap.has(match.tconst)) {
+          candidateMap.set(match.tconst, {
+            tconst: match.tconst,
+            vector,
+            totalDistance: distance,
+            occurrences: 1,
+          })
+        } else {
+          const existing = candidateMap.get(match.tconst)
+          existing.totalDistance += distance
+          existing.occurrences += 1
+        }
+      }
+    }
+
+    currentTime = logTiming(`KNN across database (${rpcCallCount} queries)`, currentTime)
+
+    // Convert map to candidates array with average distance
+    candidates = [...candidateMap.values()].map(candidate => ({
+      tconst: candidate.tconst,
+      avgDistance: candidate.totalDistance / candidate.occurrences,
+      occurrences: candidate.occurrences,
+    }))
+  } else if (method === 'kmeans') {
+    const k = Math.min(
+      Math.max(Number.parseInt(req.query.k, 10) || 4, 1),
+      likedVectors.length + syntheticVectors.length
+    )
+
+    const augmentedVectors = [...likedVectors, ...syntheticVectors]
+    const dataMatrix = augmentedVectors.map((row) => row.vector)
+
+    const clusters = kMeans(dataMatrix, k)
+
+    let rpcCallCount = 0
+
+    const rpcPromises = clusters.map((cluster) => {
+      const repVec = cluster.centroid
 
       return supabaseAdmin.rpc('match_movies', {
         query_embedding: repVec,
@@ -602,48 +812,114 @@ router.get('/:id/recommend', async (req, res) => {
         match_count: 10,
         min_release_year: minLikedYear === null ? null : minLikedYear - 5,
         min_numratings: minLikedNumRatings === null ? null : Math.ceil(minLikedNumRatings * 0.8),
-      }).then(result => ({ clusterIndices, result }))
+      }).then(result => ({ cluster, result }))
     })
 
-  const rpcResults = await Promise.all(rpcPromises)
+    const rpcResults = await Promise.all(rpcPromises)
 
-  for (const rpcData of rpcResults) {
-    if (!rpcData) continue
+    for (const rpcData of rpcResults) {
+      const { cluster, result } = rpcData
+      const { data: matches, error: rpcError } = result
 
-    const { clusterIndices, result } = rpcData
-    const { data: matches, error: rpcError } = result
+      if (rpcError) {
+        return res.status(500).json({ error: rpcError.message })
+      }
 
-    if (rpcError) {
-      return res.status(500).json({ error: rpcError.message })
+      rpcCallCount += 1
+
+      for (const match of matches || []) {
+        if (!match?.tconst || likedIdSet.has(match.tconst) || candidateMap.has(match.tconst)) {
+          continue
+        }
+
+        const vector = parseVector(match.vector)
+        if (!vector.length) {
+          continue
+        }
+
+        const fitScore = euclideanDistance(vector, cluster.centroid)
+
+        candidateMap.set(match.tconst, {
+          tconst: match.tconst,
+          vector,
+          fitScore,
+        })
+      }
     }
 
-    rpcCallCount++
-    for (const match of matches || []) {
-      if (!match?.tconst || likedIdSet.has(match.tconst) || candidateMap.has(match.tconst)) {
-        continue
-      }
+    currentTime = logTiming(`K-means RPC calls (${rpcCallCount} clusters)`, currentTime)
 
-      const vector = parseVector(match.vector)
-      if (!vector.length) {
-        continue
-      }
+    candidates = [...candidateMap.values()]
+  } else {
+    // HDBSCAN approach (default)
+    const augmentedVectors = [...likedVectors, ...syntheticVectors]
+    const dataMatrix = augmentedVectors.map((row) => row.vector)
+    const clusters = (await runHdbscanJSQuiet(dataMatrix, SYTHETIC_K * 1.5))
+    currentTime = logTiming('HDBSCAN clustering', currentTime)
+    const clusterList = clusters.length ? clusters : [dataMatrix.map((_, index) => index)]
 
-      const fitScore = clusterIndices.reduce(
-        (sum, clusterIndex) => sum + euclideanDistance(vector, dataMatrix[clusterIndex]),
-        0,
-      )
+    let rpcCallCount = 0
 
-      candidateMap.set(match.tconst, {
-        tconst: match.tconst,
-        vector,
-        fitScore,
+    const rpcPromises = clusterList
+      .sort((a, b) => b.length - a.length)
+      .slice(0, 5)
+      .map((clusterIndices) => {
+        const medoidIdx = medoidIndex(clusterIndices, dataMatrix)
+        const repVec = augmentedVectors[medoidIdx]?.vector
+
+        if (!repVec || !repVec.length) {
+          return Promise.resolve(null)
+        }
+
+        return supabaseAdmin.rpc('match_movies', {
+          query_embedding: repVec,
+          match_threshold: 0.5,
+          match_count: 10,
+          min_release_year: minLikedYear === null ? null : minLikedYear - 5,
+          min_numratings: minLikedNumRatings === null ? null : Math.ceil(minLikedNumRatings * 0.8),
+        }).then(result => ({ clusterIndices, result }))
       })
+
+    const rpcResults = await Promise.all(rpcPromises)
+
+    for (const rpcData of rpcResults) {
+      if (!rpcData) continue
+
+      const { clusterIndices, result } = rpcData
+      const { data: matches, error: rpcError } = result
+
+      if (rpcError) {
+        return res.status(500).json({ error: rpcError.message })
+      }
+
+      rpcCallCount++
+      for (const match of matches || []) {
+        if (!match?.tconst || likedIdSet.has(match.tconst) || candidateMap.has(match.tconst)) {
+          continue
+        }
+
+        const vector = parseVector(match.vector)
+        if (!vector.length) {
+          continue
+        }
+
+        const fitScore = clusterIndices.reduce(
+          (sum, clusterIndex) => sum + euclideanDistance(vector, dataMatrix[clusterIndex]),
+          0,
+        )
+
+        candidateMap.set(match.tconst, {
+          tconst: match.tconst,
+          vector,
+          fitScore,
+        })
+      }
     }
+
+    currentTime = logTiming(`RPC calls (${rpcCallCount} clusters)`, currentTime)
+
+    candidates = [...candidateMap.values()]
   }
-
-  currentTime = logTiming(`RPC calls (${rpcCallCount} clusters)`, currentTime)
-
-  const candidates = [...candidateMap.values()]
 
   if (!candidates.length) {
     return res.json({ neighbors: [] })
@@ -692,7 +968,7 @@ router.get('/:id/recommend', async (req, res) => {
     return res.json({ neighbors: [] })
   }
 
-  const fitScores = filteredCandidates.map((candidate) => candidate.fitScore)
+  const fitScores = filteredCandidates.map((candidate) => candidate[method === 'knn' ? 'avgDistance' : 'fitScore'])
   const minFit = Math.min(...fitScores)
   const maxFit = Math.max(...fitScores)
 
@@ -700,13 +976,23 @@ router.get('/:id/recommend', async (req, res) => {
     .map((candidate) => {
       const details = movieDetailsById[candidate.tconst]
       const rating = Number(details.rating) || 0
-      const normFitScore = maxFit === minFit ? 0 : (candidate.fitScore - minFit) / (maxFit - minFit)
-      const score = rating * (1 - normFitScore)
+      const fitValue = method === 'knn' ? candidate.avgDistance : candidate.fitScore
+      const normFitScore = maxFit === minFit ? 0 : (fitValue - minFit) / (maxFit - minFit)
+      
+      let score
+      if (method === 'knn') {
+        // KNN scoring: combine movie rating with proximity and occurrence frequency
+        score = rating * (1 - normFitScore * 0.5) + (candidate.occurrences || 0) * 0.1
+      } else {
+        // HDBSCAN scoring: focus on rating and fit
+        score = rating * (1 - normFitScore)
+      }
 
       return {
         ...details,
-        fit_score: candidate.fitScore,
+        fit_score: fitValue,
         norm_fit_score: normFitScore,
+        ...(method === 'knn' && { knn_occurrences: candidate.occurrences }),
         score,
       }
     })
@@ -719,7 +1005,11 @@ router.get('/:id/recommend', async (req, res) => {
         return (right.rating || 0) - (left.rating || 0)
       }
 
-      return left.fit_score - right.fit_score
+      if (method === 'knn') {
+        return (right.knn_occurrences || 0) - (left.knn_occurrences || 0)
+      } else {
+        return left.fit_score - right.fit_score
+      }
     })
 
 
