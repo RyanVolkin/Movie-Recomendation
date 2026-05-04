@@ -1,5 +1,6 @@
 const express = require('express')
 const supabaseAdmin = require('../supabaseAdmin')
+const KMeans = require('ml-kmeans')
 
 const router = express.Router()
 const MOVIE_SELECT =
@@ -437,57 +438,14 @@ async function runHdbscanJS(dataMatrix, minClusterSize = 2, minSamples = null) {
   }
 }
 
-function kMeans(dataMatrix, k = 4, maxIterations = 100) {
+function kMeans(dataMatrix, k = 4) {
   if (!dataMatrix.length) return []
 
   k = Math.min(k, dataMatrix.length)
 
-  let centroids = dataMatrix.slice(0, k).map(vector => [...vector])
-  let assignments = new Array(dataMatrix.length).fill(-1)
-
-  for (let iter = 0; iter < maxIterations; iter += 1) {
-    let changed = false
-
-    for (let i = 0; i < dataMatrix.length; i += 1) {
-      let bestCluster = 0
-      let bestDistance = Infinity
-
-      for (let c = 0; c < centroids.length; c += 1) {
-        const distance = euclideanDistance(dataMatrix[i], centroids[c])
-        if (distance < bestDistance) {
-          bestDistance = distance
-          bestCluster = c
-        }
-      }
-
-      if (assignments[i] !== bestCluster) {
-        assignments[i] = bestCluster
-        changed = true
-      }
-    }
-
-    if (!changed) break
-
-    const sums = centroids.map(() => new Array(dataMatrix[0].length).fill(0))
-    const counts = centroids.map(() => 0)
-
-    for (let i = 0; i < dataMatrix.length; i += 1) {
-      const cluster = assignments[i]
-      counts[cluster] += 1
-
-      for (let j = 0; j < dataMatrix[i].length; j += 1) {
-        sums[cluster][j] += dataMatrix[i][j]
-      }
-    }
-
-    for (let c = 0; c < centroids.length; c += 1) {
-      if (counts[c] === 0) continue
-
-      for (let j = 0; j < centroids[c].length; j += 1) {
-        centroids[c][j] = sums[c][j] / counts[c]
-      }
-    }
-  }
+  const result = KMeans(dataMatrix, k, { seed: 42 })
+  const centroids = result.centroids
+  const assignments = result.clusters
 
   return centroids.map((centroid, clusterIndex) => ({
     centroid,
