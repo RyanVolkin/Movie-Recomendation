@@ -511,8 +511,8 @@ router.get('/:id/recommend', async (req, res) => {
     .slice(0, 5)
     .map(([genre]) => genre)
 
-  const SYTHETIC_K = 8
   const GLOBAL_SYNTHETIC_CAP = 100
+  const SYTHETIC_K = Math.max(1, Math.min(8, Math.floor(GLOBAL_SYNTHETIC_CAP / likedVectors.length)))
   const syntheticVectors = []
   const syntheticBlend = 0.35
   const syntheticCountByMovie = {}
@@ -522,7 +522,6 @@ router.get('/:id/recommend', async (req, res) => {
     if (!centroid) continue
 
     for (const likedVector of likedVectors) {
-      if (syntheticVectors.length >= GLOBAL_SYNTHETIC_CAP) break
 
       const movieId = likedVector.tconst
       const genres = genresByMovieId[movieId] || []
@@ -538,13 +537,11 @@ router.get('/:id/recommend', async (req, res) => {
 
       syntheticCountByMovie[movieId] = currentCount + 1
     }
-
-    if (syntheticVectors.length >= GLOBAL_SYNTHETIC_CAP) break
   }
 
   const augmentedVectors = [...likedVectors, ...syntheticVectors]
   const dataMatrix = augmentedVectors.map((row) => row.vector)
-  const clusters = (await runHdbscanJS(dataMatrix, minClusterSize, SYTHETIC_K * 1.5)).filter((cluster) => cluster.length >= minClusterSize)
+  const clusters = (await runHdbscanJS(dataMatrix, SYTHETIC_K * 1.5))
   const clusterList = clusters.length ? clusters : [dataMatrix.map((_, index) => index)]
 
   const candidateMap = new Map()
@@ -589,7 +586,6 @@ router.get('/:id/recommend', async (req, res) => {
         tconst: match.tconst,
         vector,
         fitScore,
-        clusterSize: clusterIndices.length,
       })
     }
   }
@@ -647,7 +643,6 @@ router.get('/:id/recommend', async (req, res) => {
         ...details,
         fit_score: candidate.fitScore,
         norm_fit_score: normFitScore,
-        cluster_size: candidate.clusterSize,
         score,
       }
     })
